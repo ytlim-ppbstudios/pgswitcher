@@ -11,35 +11,50 @@ import (
 )
 
 // Backend 는 PgBouncer [databases] 항목을 JSON 객체로 받은 것. 예: {"host": "db.example.com", "port": 5432}
-// 값은 문자열 또는 숫자만 받고, 내부에서는 문자열로 들고 있는다.
+// 키마다 JSON 타입을 검사하고, 내부에서는 pgbouncer.ini 에 쓸 문자열로 들고 있는다.
+// 요청 형식은 README 의 "PUT /backend" 참고.
 type Backend map[string]string
 
-// backendKeys 는 PgBouncer 가 [databases] 항목에서 받는 키.
-var backendKeys = map[string]bool{
-	"dbname":                    true,
-	"host":                      true,
-	"port":                      true,
-	"user":                      true,
-	"password":                  true,
-	"auth_user":                 true,
-	"auth_query":                true,
-	"auth_dbname":               true,
-	"pool_size":                 true,
-	"min_pool_size":             true,
-	"reserve_pool_size":         true,
-	"connect_query":             true,
-	"pool_mode":                 true,
-	"load_balance_hosts":        true,
-	"max_db_connections":        true,
-	"max_db_client_connections": true,
-	"server_lifetime":           true,
-	"client_encoding":           true,
-	"datestyle":                 true,
-	"timezone":                  true,
-	"application_name":          true,
+type keyKind int
+
+const (
+	kindString keyKind = iota // JSON 문자열
+	kindUint                  // 0 이상의 JSON 정수
+	kindPort                  // 1~65535 JSON 정수
+	kindEnum                  // 정해진 값 중 하나인 JSON 문자열
+)
+
+type keySpec struct {
+	kind   keyKind
+	values []string // kindEnum 일 때 허용 값
 }
 
-// ParseBackend 는 JSON 객체를 읽어 검증한다. host 는 필수.
+// backendKeys 는 PgBouncer 가 [databases] 항목에서 받는 키와 타입.
+var backendKeys = map[string]keySpec{
+	"host":                      {kind: kindString},
+	"port":                      {kind: kindPort},
+	"dbname":                    {kind: kindString},
+	"user":                      {kind: kindString},
+	"password":                  {kind: kindString},
+	"auth_user":                 {kind: kindString},
+	"auth_query":                {kind: kindString},
+	"auth_dbname":               {kind: kindString},
+	"pool_size":                 {kind: kindUint},
+	"min_pool_size":             {kind: kindUint},
+	"reserve_pool_size":         {kind: kindUint},
+	"max_db_connections":        {kind: kindUint},
+	"max_db_client_connections": {kind: kindUint},
+	"server_lifetime":           {kind: kindUint},
+	"pool_mode":                 {kind: kindEnum, values: []string{"session", "transaction", "statement"}},
+	"load_balance_hosts":        {kind: kindEnum, values: []string{"disable", "round-robin"}},
+	"connect_query":             {kind: kindString},
+	"client_encoding":           {kind: kindString},
+	"datestyle":                 {kind: kindString},
+	"timezone":                  {kind: kindString},
+	"application_name":          {kind: kindString},
+}
+
+// ParseBackend 는 JSON 객체를 읽어 키별 타입을 검증한다. host 는 필수.
 func ParseBackend(data []byte) (Backend, error) {
 	var raw map[string]any
 	dec := json.NewDecoder(bytes.NewReader(data))
@@ -53,36 +68,57 @@ func ParseBackend(data []byte) (Backend, error) {
 
 	b := Backend{}
 	for k, v := range raw {
-		if !backendKeys[k] {
+		spec, ok := backendKeys[k]
+		if !ok {
 			return nil, fmt.Errorf("unknown key %q", k)
 		}
-		switch v := v.(type) {
-		case string:
-			b[k] = v
-		case json.Number:
-			b[k] = v.String()
-		default:
-			return nil, fmt.Errorf("%s: must be a string or number", k)
+		val, err := spec.parse(v)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", k, err)
 		}
-		if b[k] == "" {
-			return nil, fmt.Errorf("%s: empty value", k)
-		}
-		// pgbouncer.ini 한 줄에 들어가야 하므로 줄바꿈은 받지 않는다.
-		if strings.ContainsAny(b[k], "\r\n\x00") {
-			return nil, fmt.Errorf("%s: must be a single line", k)
-		}
+		b[k] = val
 	}
-
-	if b["host"] == "" {
+	if _, ok := b["host"]; !ok {
 		return nil, fmt.Errorf("host is required")
 	}
-	if p, ok := b["port"]; ok {
-		n, err := strconv.Atoi(p)
-		if err != nil || n < 1 || n > 65535 {
-			return nil, fmt.Errorf("invalid port %q", p)
-		}
-	}
 	return b, nil
+}
+
+func (s keySpec) parse(v any) (string, error) {
+	switch s.kind {
+	case kindUint, kindPort:
+		num, ok := v.(json.Number)
+		if !ok {
+			return "", fmt.Errorf("must be a number")
+		}
+		n, err := strconv.ParseInt(num.String(), 10, 32)
+		if err != nil {
+			return "", fmt.Errorf("must be an integer")
+		}
+		if s.kind == kindPort && (n < 1 || n > 65535) {
+			return "", fmt.Errorf("must be between 1 and 65535")
+		}
+		if n < 0 {
+			return "", fmt.Errorf("must not be negative")
+		}
+		return strconv.FormatInt(n, 10), nil
+	}
+
+	str, ok := v.(string)
+	if !ok {
+		return "", fmt.Errorf("must be a string")
+	}
+	if str == "" {
+		return "", fmt.Errorf("must not be empty")
+	}
+	// pgbouncer.ini 한 줄에 들어가야 하므로 줄바꿈은 받지 않는다.
+	if strings.ContainsAny(str, "\r\n\x00") {
+		return "", fmt.Errorf("must be a single line")
+	}
+	if s.kind == kindEnum && !slices.Contains(s.values, str) {
+		return "", fmt.Errorf("must be one of %s", strings.Join(s.values, ", "))
+	}
+	return str, nil
 }
 
 // keys 는 host, port 를 앞에 두고 나머지는 이름순으로 정렬한다.

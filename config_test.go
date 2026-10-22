@@ -9,7 +9,7 @@ import (
 
 func testEnv(extra map[string]string) (func(string) string, []string) {
 	env := map[string]string{
-		"PGSW_BACKEND":        "host=old.example.com port=5432",
+		"PGSW_BACKEND":        `{"host": "old.example.com", "port": 5432}`,
 		"PGSW_ADMIN_PASSWORD": `pa"ss`,
 		"PGSW_USERLIST":       `"app" "secret"`,
 	}
@@ -29,7 +29,7 @@ func TestLoadConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := c.Backend.Get("host"); got != "old.example.com" {
+	if got := c.Backend["host"]; got != "old.example.com" {
 		t.Errorf("host = %q", got)
 	}
 	if got := c.Settings["pool_mode"]; got != "transaction" {
@@ -40,7 +40,7 @@ func TestLoadConfig(t *testing.T) {
 func TestLoadConfigErrors(t *testing.T) {
 	cases := map[string]map[string]string{
 		"no backend":        {"PGSW_BACKEND": ""},
-		"bad backend":       {"PGSW_BACKEND": "port=5432"},
+		"bad backend":       {"PGSW_BACKEND": `{"port": 5432}`},
 		"locked setting":    {"PGBOUNCER_LISTEN_ADDR": "1.2.3.4"},
 		"newline in value":  {"PGBOUNCER_POOL_MODE": "session\nadmin_users = x"},
 		"half tls":          {"PGSW_TLS_KEY": "k"},
@@ -77,7 +77,7 @@ func TestRender(t *testing.T) {
 	if got := c.RenderDatabases(); !strings.Contains(got, "* = host=old.example.com port=5432") {
 		t.Errorf("databases:\n%s", got)
 	}
-	c.Backend, _ = ParseConnstring("host=new.example.com port=6543")
+	c.Backend, _ = ParseBackend([]byte(`{"host": "new.example.com", "port": 6543}`))
 	if got := c.RenderDatabases(); !strings.Contains(got, "* = host=new.example.com port=6543") {
 		t.Errorf("databases after switch:\n%s", got)
 	}

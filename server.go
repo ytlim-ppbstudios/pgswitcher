@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"maps"
 	"net/http"
@@ -99,13 +100,13 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 }
 
 type configView struct {
-	Backend  Connstring        `json:"backend"`
+	Backend  Backend           `json:"backend"`
 	Settings map[string]string `json:"settings"`
 }
 
 func (s *Server) view() configView {
 	return configView{
-		Backend:  s.cfg.Backend,
+		Backend:  s.cfg.Backend.Redacted(),
 		Settings: maps.Clone(s.cfg.Settings),
 	}
 }
@@ -148,32 +149,29 @@ func (s *Server) apply(ctx context.Context, mutate func(c *Config) error) (confi
 	return s.view(), nil
 }
 
-type backendRequest struct {
-	Conn string `json:"conn"`
-}
-
-// putBackend 는 모든 DB 가 향하는 백엔드 연결 문자열을 교체한다.
+// putBackend 는 모든 DB 가 향하는 백엔드를 교체한다. 본문은 백엔드 JSON 객체 그대로.
 // 기존 서버 커넥션은 반납되는 대로 닫히고, 새 커넥션은 새 백엔드로 붙는다.
 func (s *Server) putBackend(w http.ResponseWriter, r *http.Request) {
-	var req backendRequest
-	if !decode(w, r, &req) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<16))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	var from Connstring
+	var from Backend
 	v, err := s.apply(r.Context(), func(c *Config) error {
-		cs, err := ParseConnstring(req.Conn)
+		b, err := ParseBackend(body)
 		if err != nil {
 			return err
 		}
 		from = c.Backend
-		c.Backend = cs
+		c.Backend = b
 		return nil
 	})
 	if err != nil {
 		writeError(w, statusOf(err), err)
 		return
 	}
-	slog.Info("changed backend", "from", from.Redacted(), "to", v.Backend.Redacted())
+	slog.Info("changed backend", "from", from.Redacted(), "to", v.Backend)
 	writeJSON(w, http.StatusOK, v)
 }
 

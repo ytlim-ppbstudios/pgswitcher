@@ -16,7 +16,7 @@ const adminUser = "pgbouncer_admin"
 type Config struct {
 	Dir           string
 	ListenPort    int
-	Backend       Connstring
+	Backend       Backend
 	Settings      map[string]string
 	Userlist      string
 	AdminPassword string
@@ -90,7 +90,7 @@ func LoadConfig(getenv func(string) string, environ []string) (*Config, error) {
 	}
 	c.ListenPort = port
 
-	c.Backend, err = ParseConnstring(getenv("PGSW_BACKEND"))
+	c.Backend, err = ParseBackend([]byte(getenv("PGSW_BACKEND")))
 	if err != nil {
 		return nil, fmt.Errorf("PGSW_BACKEND: %w", err)
 	}

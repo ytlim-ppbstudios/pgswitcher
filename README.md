@@ -4,7 +4,7 @@ PgBouncer를 자식 프로세스로 띄우고, 백엔드 전환과 설정 변경
 DB 이전 때 앱들은 PgBouncer에만 붙여 두고, 백엔드만 바꿔 DNS 전파를 기다리지 않고 한 곳에서 전환하려고 만들었다.
 
 - 이미지는 `edoburu/pgbouncer:v1.26.1-p0` 위에 pgswitcher 바이너리만 얹는다. PgBouncer 코드는 이 레포에 없다.
-- 모든 DB 이름을 백엔드 연결 문자열 하나로 보낸다 (`[databases] * = <PGSW_BACKEND>`).
+- 모든 DB 이름을 백엔드 하나로 보낸다 (`[databases] * = host=... port=...`). 백엔드는 JSON으로 받는다.
 - 시작할 때는 환경변수(예: Secrets Manager에서 주입한 값)로 초기 설정을 만들고, 이후 변경은 API → 파일 재작성 → `RELOAD` 순서로 반영한다.
 - API로 바꾼 값은 메모리와 컨테이너 안 파일에만 남는다. 재시작하면 환경변수 값으로 돌아가므로, 유지하려면 초기값 쪽도 같이 바꾼다.
 
@@ -15,7 +15,7 @@ DB 이전 때 앱들은 PgBouncer에만 붙여 두고, 백엔드만 바꿔 DNS �
 :8080  pgswitcher  HTTP API (관리 콘솔에 127.0.0.1:5432로 붙어 명령 실행)
 
 /etc/pgbouncer/pgbouncer.ini   공통 설정, 마지막 줄에서 databases.ini를 %include
-/etc/pgbouncer/databases.ini   백엔드 연결 문자열. 전환하면 이 파일만 바뀐다
+/etc/pgbouncer/databases.ini   백엔드. 전환하면 이 파일만 바뀐다
 /etc/pgbouncer/userlist.txt    PGSW_USERLIST + 관리 계정 pgbouncer_admin
 ```
 
@@ -25,7 +25,7 @@ pgswitcher가 PID 1이다. SIGTERM, SIGINT, SIGHUP은 PgBouncer에 넘기고, Pg
 
 | 이름 | 필수 | 설명 |
 |---|---|---|
-| `PGSW_BACKEND` | O | 초기 백엔드 연결 문자열 (아래 형식). 예: `host=old.rds.amazonaws.com port=5432` |
+| `PGSW_BACKEND` | O | 초기 백엔드 JSON (아래 형식). 예: `{"host":"old.rds.amazonaws.com","port":5432}` |
 | `PGSW_TOKEN` | O | 변경 API의 Bearer 토큰 |
 | `PGSW_ADMIN_PASSWORD` | O | 관리 콘솔 계정 `pgbouncer_admin` 비밀번호 |
 | `PGSW_USERLIST` | | userlist.txt 본문. 한 줄에 `"user" "plain-password"`. 평문이어야 앱 쪽 SCRAM과 백엔드 로그인을 둘 다 한다 |
@@ -39,16 +39,18 @@ pgswitcher가 PID 1이다. SIGTERM, SIGINT, SIGHUP은 PgBouncer에 넘기고, Pg
 
 인증은 `scram-sha-256` 고정이다.
 
-## 백엔드 연결 문자열
+## 백엔드 JSON
 
-PgBouncer `[databases]` 항목의 값 형식 그대로다. 공백으로 구분한 `key=value`, 공백이나 따옴표가 든 값은 작은따옴표로 감싸고 따옴표는 두 번 쓴다.
+PgBouncer `[databases]` 항목의 키를 그대로 쓰는 JSON 객체다. 값은 문자열이나 숫자.
 
+```json
+{"host": "db.example.com", "port": 5432}
+{"host": "db.example.com", "port": 5432, "pool_size": 50, "application_name": "pgbouncer"}
 ```
-host=db.example.com port=5432
-host=db.example.com port=5432 pool_size=50 application_name=pgbouncer
-```
 
-- `host`는 필수. 키는 PgBouncer가 받는 것만 허용 (`dbname`, `host`, `port`, `user`, `password`, `pool_size`, `pool_mode`, `max_db_connections` 등. `connstring.go` 참고)
+pgswitcher가 PgBouncer 연결 문자열(`host=db.example.com port=5432 ...`)로 바꿔 `databases.ini`에 쓴다. 따옴표 처리도 pgswitcher가 한다.
+
+- `host`는 필수. 키는 PgBouncer가 받는 것만 허용 (`dbname`, `host`, `port`, `user`, `password`, `pool_size`, `pool_mode`, `max_db_connections` 등. `backend.go` 참고)
 - 와일드카드(`*`) 항목이라 `dbname`을 넣으면 모든 DB 이름이 그 DB로 간다. 보통은 넣지 않는다
 - 인증은 userlist로 하므로 `user`/`password`도 보통 넣지 않는다. 넣은 경우 API 응답과 로그에서 password는 가린다
 
@@ -60,8 +62,8 @@ host=db.example.com port=5432 pool_size=50 application_name=pgbouncer
 |---|---|---|
 | GET | `/healthz` | PgBouncer 프로세스와 관리 콘솔 응답만 확인 (`SHOW VERSION`). 백엔드는 보지 않는다 |
 | GET | `/stats` | `SHOW STATE/STATS/POOLS/DATABASES/LISTS`를 JSON으로. 관리 콘솔이 응답 없으면 503이라 헬스체크로도 쓸 수 있다. `?sections=state,pools`로 골라 받기 |
-| GET | `/config` | 백엔드 연결 문자열(password는 `****`), 설정 |
-| PUT | `/backend` | `{"conn":"host=... port=5432"}` 백엔드 교체 → RELOAD |
+| GET | `/config` | 백엔드(password는 `****`), 설정 |
+| PUT | `/backend` | 본문이 백엔드 JSON 그대로. 예: `{"host":"...","port":5432}`. 교체 → RELOAD |
 | PATCH | `/settings` | `{"default_pool_size":"500"}` 설정 변경 → RELOAD |
 | POST | `/pause` | `PAUSE`. `?timeout=10s` 안에 끝나지 않으면 202 `pausing`을 주고 백그라운드에서 계속 기다린다 |
 | POST | `/resume` | `RESUME` |
@@ -84,7 +86,7 @@ H="Authorization: Bearer $PGSW_TOKEN"
 curl -X POST -H "$H" "$A/pause?timeout=1s"     # 대기 상태 진입. 새 요청은 PgBouncer에서 기다린다
 # 기존 DB: NOLOGIN + 세션 종료 → PAUSE 완료. CDC 반영 대기
 curl "$A/stats?sections=state,pools"           # paused=yes, cl_waiting 확인
-curl -X PUT -H "$H" "$A/backend" -d '{"conn":"host=new.rds.amazonaws.com port=5432"}'
+curl -X PUT -H "$H" "$A/backend" -d '{"host":"new.rds.amazonaws.com","port":5432}'
 curl -X POST -H "$H" "$A/resume"               # 대기하던 요청이 새 백엔드로 붙는다
 ```
 

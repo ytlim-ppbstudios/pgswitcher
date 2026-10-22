@@ -1,5 +1,5 @@
-// pgswitcher runs PgBouncer as a child process and exposes an HTTP API
-// to switch its backend and change settings at runtime.
+// pgswitcher 는 PgBouncer 를 자식 프로세스로 띄우고,
+// 백엔드 교체와 설정 변경을 런타임에 하는 HTTP API 를 연다.
 package main
 
 import (
@@ -43,7 +43,7 @@ func run() int {
 		slog.Error("start pgbouncer", "error", err)
 		return 1
 	}
-	slog.Info("started pgbouncer", "pid", cmd.Process.Pid, "active_target", cfg.ActiveTarget)
+	slog.Info("started pgbouncer", "pid", cmd.Process.Pid, "backend", cfg.Backend.Redacted())
 
 	var running atomic.Bool
 	running.Store(true)
@@ -75,8 +75,8 @@ func run() int {
 		}
 	}()
 
-	// Forward stop/reload signals to PgBouncer and exit when it exits,
-	// so the orchestrator sees PgBouncer's lifecycle.
+	// 종료/리로드 시그널은 PgBouncer 에 넘기고, PgBouncer 가 끝나면 같이 끝낸다.
+	// 오케스트레이터가 PgBouncer 생존 여부를 그대로 보게 하려는 것.
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 	for {

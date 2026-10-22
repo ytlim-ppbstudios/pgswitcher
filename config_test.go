@@ -9,8 +9,7 @@ import (
 
 func testEnv(extra map[string]string) (func(string) string, []string) {
 	env := map[string]string{
-		"PGSW_TARGETS":        "v2=old.example.com,v3=new.example.com:6543",
-		"PGSW_ACTIVE_TARGET":  "v2",
+		"PGSW_BACKEND":        `{"host": "old.example.com", "port": 5432}`,
 		"PGSW_ADMIN_PASSWORD": `pa"ss`,
 		"PGSW_USERLIST":       `"app" "secret"`,
 	}
@@ -30,11 +29,8 @@ func TestLoadConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := c.Targets["v3"]; got != (Target{Host: "new.example.com", Port: 6543}) {
-		t.Errorf("v3 = %+v", got)
-	}
-	if got := c.Targets["v2"].Port; got != 5432 {
-		t.Errorf("v2 port = %d", got)
+	if got := c.Backend["host"]; got != "old.example.com" {
+		t.Errorf("host = %q", got)
 	}
 	if got := c.Settings["pool_mode"]; got != "transaction" {
 		t.Errorf("pool_mode = %q", got)
@@ -43,12 +39,12 @@ func TestLoadConfig(t *testing.T) {
 
 func TestLoadConfigErrors(t *testing.T) {
 	cases := map[string]map[string]string{
-		"unknown active target": {"PGSW_ACTIVE_TARGET": "v9"},
-		"bad host":              {"PGSW_TARGETS": "v2=bad host"},
-		"locked setting":        {"PGBOUNCER_LISTEN_ADDR": "1.2.3.4"},
-		"newline in value":      {"PGBOUNCER_POOL_MODE": "session\nadmin_users = x"},
-		"half tls":              {"PGSW_TLS_KEY": "k"},
-		"no admin password":     {"PGSW_ADMIN_PASSWORD": ""},
+		"no backend":        {"PGSW_BACKEND": ""},
+		"bad backend":       {"PGSW_BACKEND": `{"port": 5432}`},
+		"locked setting":    {"PGBOUNCER_LISTEN_ADDR": "1.2.3.4"},
+		"newline in value":  {"PGBOUNCER_POOL_MODE": "session\nadmin_users = x"},
+		"half tls":          {"PGSW_TLS_KEY": "k"},
+		"no admin password": {"PGSW_ADMIN_PASSWORD": ""},
 	}
 	for name, extra := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -81,7 +77,7 @@ func TestRender(t *testing.T) {
 	if got := c.RenderDatabases(); !strings.Contains(got, "* = host=old.example.com port=5432") {
 		t.Errorf("databases:\n%s", got)
 	}
-	c.ActiveTarget = "v3"
+	c.Backend, _ = ParseBackend([]byte(`{"host": "new.example.com", "port": 6543}`))
 	if got := c.RenderDatabases(); !strings.Contains(got, "* = host=new.example.com port=6543") {
 		t.Errorf("databases after switch:\n%s", got)
 	}

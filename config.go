@@ -12,18 +12,11 @@ import (
 
 const adminUser = "pgbouncer_admin"
 
-// Target is a backend PostgreSQL endpoint that every database is routed to.
-type Target struct {
-	Host string `json:"host"`
-	Port int    `json:"port"`
-}
-
-// Config is everything needed to render PgBouncer's configuration files.
+// Config 는 PgBouncer 설정 파일을 만드는 데 필요한 값 전체.
 type Config struct {
 	Dir           string
 	ListenPort    int
-	Targets       map[string]Target
-	ActiveTarget  string
+	Backend       Connstring
 	Settings      map[string]string
 	Userlist      string
 	AdminPassword string
@@ -31,7 +24,7 @@ type Config struct {
 	TLSCert       string
 }
 
-// defaultSettings are applied before PGBOUNCER_* overrides.
+// defaultSettings 는 PGBOUNCER_* 환경변수로 덮어쓰기 전 기본값.
 var defaultSettings = map[string]string{
 	"pool_mode":                 "session",
 	"max_client_conn":           "5000",
@@ -48,8 +41,8 @@ var defaultSettings = map[string]string{
 	"stats_period":              "60",
 }
 
-// runtimeSettings can be changed through the API and applied with RELOAD.
-// Settings outside this list (listen address, auth, TLS files) need a restart or are managed by pgswitcher.
+// runtimeSettings 는 API 로 바꾸고 RELOAD 로 반영할 수 있는 설정.
+// 여기 없는 설정(리슨 주소, 인증, TLS 파일)은 재시작이 필요하거나 pgswitcher 가 직접 관리한다.
 var runtimeSettings = map[string]bool{
 	"pool_mode":                 true,
 	"max_client_conn":           true,
@@ -77,16 +70,13 @@ var runtimeSettings = map[string]bool{
 }
 
 var (
-	targetNameRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
-	hostRe       = regexp.MustCompile(`^[A-Za-z0-9.-]+$`)
-	settingRe    = regexp.MustCompile(`^[A-Za-z0-9_.,:/ -]*$`)
+	settingRe = regexp.MustCompile(`^[A-Za-z0-9_.,:/ -]*$`)
 )
 
-// LoadConfig reads the configuration from environment variables.
+// LoadConfig 는 환경변수에서 설정을 읽는다.
 func LoadConfig(getenv func(string) string, environ []string) (*Config, error) {
 	c := &Config{
 		Dir:           orDefault(getenv("PGSW_CONFIG_DIR"), "/etc/pgbouncer"),
-		ActiveTarget:  getenv("PGSW_ACTIVE_TARGET"),
 		Userlist:      getenv("PGSW_USERLIST"),
 		AdminPassword: getenv("PGSW_ADMIN_PASSWORD"),
 		TLSKey:        getenv("PGSW_TLS_KEY"),
@@ -100,12 +90,9 @@ func LoadConfig(getenv func(string) string, environ []string) (*Config, error) {
 	}
 	c.ListenPort = port
 
-	c.Targets, err = parseTargets(getenv("PGSW_TARGETS"))
+	c.Backend, err = ParseConnstring(getenv("PGSW_BACKEND"))
 	if err != nil {
-		return nil, fmt.Errorf("PGSW_TARGETS: %w", err)
-	}
-	if _, ok := c.Targets[c.ActiveTarget]; !ok {
-		return nil, fmt.Errorf("PGSW_ACTIVE_TARGET %q is not in PGSW_TARGETS", c.ActiveTarget)
+		return nil, fmt.Errorf("PGSW_BACKEND: %w", err)
 	}
 	if c.AdminPassword == "" {
 		return nil, fmt.Errorf("PGSW_ADMIN_PASSWORD is required")
@@ -117,7 +104,7 @@ func LoadConfig(getenv func(string) string, environ []string) (*Config, error) {
 	for k, v := range defaultSettings {
 		c.Settings[k] = v
 	}
-	// PGBOUNCER_POOL_MODE=transaction -> pool_mode = transaction
+	// 예: PGBOUNCER_POOL_MODE=transaction -> pool_mode = transaction
 	for _, kv := range environ {
 		k, v, ok := strings.Cut(kv, "=")
 		if !ok || !strings.HasPrefix(k, "PGBOUNCER_") {
@@ -132,52 +119,6 @@ func LoadConfig(getenv func(string) string, environ []string) (*Config, error) {
 	return c, nil
 }
 
-// parseTargets parses "v2=host-a:5432,v3=host-b" (port defaults to 5432).
-func parseTargets(s string) (map[string]Target, error) {
-	targets := map[string]Target{}
-	for _, item := range strings.Split(s, ",") {
-		item = strings.TrimSpace(item)
-		if item == "" {
-			continue
-		}
-		name, addr, ok := strings.Cut(item, "=")
-		if !ok {
-			return nil, fmt.Errorf("%q: want name=host[:port]", item)
-		}
-		host, portStr, hasPort := strings.Cut(addr, ":")
-		port := 5432
-		if hasPort {
-			p, err := strconv.Atoi(portStr)
-			if err != nil {
-				return nil, fmt.Errorf("%q: invalid port", item)
-			}
-			port = p
-		}
-		t := Target{Host: host, Port: port}
-		if err := validateTarget(name, t); err != nil {
-			return nil, err
-		}
-		targets[name] = t
-	}
-	if len(targets) == 0 {
-		return nil, fmt.Errorf("at least one target is required")
-	}
-	return targets, nil
-}
-
-func validateTarget(name string, t Target) error {
-	if !targetNameRe.MatchString(name) {
-		return fmt.Errorf("invalid target name %q", name)
-	}
-	if !hostRe.MatchString(t.Host) {
-		return fmt.Errorf("invalid host %q", t.Host)
-	}
-	if t.Port < 1 || t.Port > 65535 {
-		return fmt.Errorf("invalid port %d", t.Port)
-	}
-	return nil
-}
-
 func validateSetting(name, value string) error {
 	if !runtimeSettings[name] {
 		return fmt.Errorf("setting %q cannot be changed", name)
@@ -190,13 +131,13 @@ func validateSetting(name, value string) error {
 
 func (c *Config) path(name string) string { return filepath.Join(c.Dir, name) }
 
-// IniPath is the main config file passed to pgbouncer.
+// IniPath 는 pgbouncer 에 넘기는 메인 설정 파일 경로.
 func (c *Config) IniPath() string { return c.path("pgbouncer.ini") }
 
-// RenderIni renders pgbouncer.ini. The [databases] section lives in databases.ini so a switch only rewrites that file.
+// RenderIni 는 pgbouncer.ini 를 만든다. [databases] 는 databases.ini 로 분리해서 백엔드 교체 때 그 파일만 다시 쓴다.
 func (c *Config) RenderIni() string {
 	var b strings.Builder
-	b.WriteString("; generated by pgswitcher. do not edit.\n[pgbouncer]\n")
+	b.WriteString("; pgswitcher 가 생성한 파일. 직접 수정하지 말 것.\n[pgbouncer]\n")
 	fmt.Fprintf(&b, "listen_addr = 0.0.0.0\nlisten_port = %d\nunix_socket_dir =\n", c.ListenPort)
 	fmt.Fprintf(&b, "auth_type = scram-sha-256\nauth_file = %s\n", c.path("userlist.txt"))
 	fmt.Fprintf(&b, "admin_users = %s\nstats_users = %s\n", adminUser, adminUser)
@@ -218,14 +159,12 @@ func (c *Config) RenderIni() string {
 	return b.String()
 }
 
-// RenderDatabases routes every database name to the active target.
+// RenderDatabases 는 모든 DB 이름을 백엔드 하나로 보내는 [databases] 를 만든다.
 func (c *Config) RenderDatabases() string {
-	t := c.Targets[c.ActiveTarget]
-	return fmt.Sprintf("; generated by pgswitcher. active target: %s\n[databases]\n* = host=%s port=%d\n",
-		c.ActiveTarget, t.Host, t.Port)
+	return fmt.Sprintf("; pgswitcher 가 생성한 파일. 직접 수정하지 말 것.\n[databases]\n* = %s\n", c.Backend)
 }
 
-// RenderUserlist appends the admin user to the given userlist.
+// RenderUserlist 는 받은 userlist 에 관리 계정을 덧붙인다.
 func (c *Config) RenderUserlist() string {
 	var b strings.Builder
 	if u := strings.TrimSpace(c.Userlist); u != "" {
@@ -236,12 +175,12 @@ func (c *Config) RenderUserlist() string {
 	return b.String()
 }
 
-// quoteUserlist quotes a userlist.txt field. A literal quote is written as two quotes.
+// quoteUserlist 는 userlist.txt 필드를 따옴표로 감싼다. 값 안의 따옴표는 두 번 쓴다.
 func quoteUserlist(s string) string {
 	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }
 
-// WriteAll writes every file pgbouncer needs.
+// WriteAll 은 pgbouncer 가 쓰는 파일을 모두 쓴다.
 func (c *Config) WriteAll() error {
 	if err := writeFileAtomic(c.path("userlist.txt"), c.RenderUserlist()); err != nil {
 		return err

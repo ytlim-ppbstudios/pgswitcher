@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-// Server exposes the HTTP API. Config changes are serialized by mu and applied with RELOAD.
+// Server 는 HTTP API. 설정 변경은 mu 로 직렬화하고 RELOAD 로 반영한다.
 type Server struct {
 	mu      sync.Mutex
 	cfg     *Config
@@ -33,8 +33,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /stats", s.stats)
 	mux.HandleFunc("GET /config", s.getConfig)
 
-	mux.Handle("POST /switch", s.auth(s.switchTarget))
-	mux.Handle("PUT /targets/{name}", s.auth(s.putTarget))
+	mux.Handle("PUT /backend", s.auth(s.putBackend))
 	mux.Handle("PATCH /settings", s.auth(s.patchSettings))
 	mux.Handle("POST /reload", s.auth(s.simple("RELOAD")))
 	mux.Handle("POST /resume", s.auth(s.simple("RESUME")))
@@ -43,8 +42,8 @@ func (s *Server) Handler() http.Handler {
 	return logRequests(mux)
 }
 
-// healthz checks PgBouncer itself only. It must not depend on the backend,
-// otherwise the orchestrator restarts PgBouncer while the backend is blocked during a cutover.
+// healthz 는 PgBouncer 자신만 확인한다. 백엔드를 보면 전환 중 백엔드를 막아 둔 구간에
+// 오케스트레이터가 PgBouncer 를 재시작해 버린다.
 func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 	if !s.running() {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "down", "error": "pgbouncer is not running"})
@@ -72,8 +71,8 @@ var statsSections = map[string]string{
 	"state":     "SHOW STATE",
 }
 
-// stats returns SHOW results as JSON. It answers 503 when the admin console is unreachable,
-// so it also works as a health check. ?sections=pools,stats limits the output.
+// stats 는 SHOW 결과를 JSON 으로 준다. 관리 콘솔이 응답하지 않으면 503 이라 헬스체크로도 쓸 수 있다.
+// ?sections=pools,stats 로 골라 받는다.
 func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 	sections := []string{"state", "stats", "pools", "databases", "lists"}
 	if q := r.URL.Query().Get("sections"); q != "" {
@@ -100,16 +99,14 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 }
 
 type configView struct {
-	ActiveTarget string            `json:"active_target"`
-	Targets      map[string]Target `json:"targets"`
-	Settings     map[string]string `json:"settings"`
+	Backend  Connstring        `json:"backend"`
+	Settings map[string]string `json:"settings"`
 }
 
 func (s *Server) view() configView {
 	return configView{
-		ActiveTarget: s.cfg.ActiveTarget,
-		Targets:      maps.Clone(s.cfg.Targets),
-		Settings:     maps.Clone(s.cfg.Settings),
+		Backend:  s.cfg.Backend,
+		Settings: maps.Clone(s.cfg.Settings),
 	}
 }
 
@@ -119,14 +116,13 @@ func (s *Server) getConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.view())
 }
 
-// apply runs mutate on a copy of the config, writes the files and reloads PgBouncer.
-// The in-memory config only changes when the reload succeeds.
+// apply 는 설정 사본에 mutate 를 적용하고 파일을 쓴 뒤 RELOAD 한다.
+// 메모리의 설정은 RELOAD 가 성공했을 때만 바뀐다.
 func (s *Server) apply(ctx context.Context, mutate func(c *Config) error) (configView, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	next := *s.cfg
-	next.Targets = maps.Clone(s.cfg.Targets)
 	next.Settings = maps.Clone(s.cfg.Settings)
 	if err := mutate(&next); err != nil {
 		return configView{}, &httpError{http.StatusBadRequest, err}
@@ -142,7 +138,7 @@ func (s *Server) apply(ctx context.Context, mutate func(c *Config) error) (confi
 		return configView{}, err
 	}
 	if _, err := s.admin.Query(ctx, "RELOAD"); err != nil {
-		// Put the previous files back so a later restart or RELOAD does not pick up a half-applied change.
+		// 이후 재시작이나 RELOAD 가 반쯤 적용된 변경을 읽지 않도록 이전 파일로 되돌린다.
 		if rerr := write(s.cfg); rerr != nil {
 			slog.Error("restore config after failed reload", "error", rerr)
 		}
@@ -152,53 +148,32 @@ func (s *Server) apply(ctx context.Context, mutate func(c *Config) error) (confi
 	return s.view(), nil
 }
 
-type switchRequest struct {
-	Target string `json:"target"`
+type backendRequest struct {
+	Conn string `json:"conn"`
 }
 
-func (s *Server) switchTarget(w http.ResponseWriter, r *http.Request) {
-	var req switchRequest
+// putBackend 는 모든 DB 가 향하는 백엔드 연결 문자열을 교체한다.
+// 기존 서버 커넥션은 반납되는 대로 닫히고, 새 커넥션은 새 백엔드로 붙는다.
+func (s *Server) putBackend(w http.ResponseWriter, r *http.Request) {
+	var req backendRequest
 	if !decode(w, r, &req) {
 		return
 	}
-	var from string
+	var from Connstring
 	v, err := s.apply(r.Context(), func(c *Config) error {
-		if _, ok := c.Targets[req.Target]; !ok {
-			return fmt.Errorf("unknown target %q", req.Target)
-		}
-		from = c.ActiveTarget
-		c.ActiveTarget = req.Target
-		return nil
-	})
-	if err != nil {
-		writeError(w, statusOf(err), err)
-		return
-	}
-	slog.Info("switched target", "from", from, "to", v.ActiveTarget)
-	writeJSON(w, http.StatusOK, v)
-}
-
-func (s *Server) putTarget(w http.ResponseWriter, r *http.Request) {
-	name := r.PathValue("name")
-	var t Target
-	if !decode(w, r, &t) {
-		return
-	}
-	if t.Port == 0 {
-		t.Port = 5432
-	}
-	v, err := s.apply(r.Context(), func(c *Config) error {
-		if err := validateTarget(name, t); err != nil {
+		cs, err := ParseConnstring(req.Conn)
+		if err != nil {
 			return err
 		}
-		c.Targets[name] = t
+		from = c.Backend
+		c.Backend = cs
 		return nil
 	})
 	if err != nil {
 		writeError(w, statusOf(err), err)
 		return
 	}
-	slog.Info("updated target", "name", name, "host", t.Host, "port", t.Port)
+	slog.Info("changed backend", "from", from.Redacted(), "to", v.Backend.Redacted())
 	writeJSON(w, http.StatusOK, v)
 }
 
@@ -234,10 +209,9 @@ func (s *Server) simple(cmd string) http.HandlerFunc {
 	}
 }
 
-// pause issues PAUSE. PgBouncer answers only after every server connection is released,
-// which in session mode means after all backend sessions end. The command keeps running
-// in the background; if it has not finished within ?timeout (default 10s) this returns 202
-// and the progress can be followed with GET /stats?sections=state,pools.
+// pause 는 PAUSE 를 보낸다. PgBouncer 는 서버 커넥션이 모두 반납돼야 응답하는데,
+// session 모드에선 백엔드 세션이 다 끝나야 한다는 뜻이다. 명령은 백그라운드에서 계속 기다리고,
+// ?timeout(기본 10s) 안에 끝나지 않으면 202 를 준다. 진행 상황은 GET /stats?sections=state,pools 로 본다.
 func (s *Server) pause(w http.ResponseWriter, r *http.Request) {
 	timeout := 10 * time.Second
 	if q := r.URL.Query().Get("timeout"); q != "" {
@@ -331,7 +305,7 @@ func (r *statusRecorder) WriteHeader(status int) {
 	r.ResponseWriter.WriteHeader(status)
 }
 
-// logRequests logs every request except successful health checks, which run every few seconds.
+// logRequests 는 요청을 로그로 남긴다. 몇 초마다 오는 성공한 GET(헬스체크 등)은 뺀다.
 func logRequests(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()

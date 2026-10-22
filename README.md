@@ -44,6 +44,8 @@ pgswitcher가 PID 1이다. SIGTERM, SIGINT, SIGHUP은 PgBouncer에 넘기고, Pg
 PgBouncer가 요청을 넘겨주는 뒤쪽 PostgreSQL. `[databases]`의 와일드카드 항목(`* = ...`) 하나로 표현하므로, 모든 DB 이름이 같은 백엔드로 간다.
 시작할 때는 `PGSW_BACKEND`, 실행 중에는 `PUT /backend`로 주고, 둘 다 같은 JSON 형식을 쓴다 (아래 [PUT /backend](#put-backend)).
 
+> 백엔드를 바꿔도 이미 맺어진 서버 커넥션은 이전 백엔드에 남는다. 전환 전에 [백엔드 교체와 기존 연결](#백엔드-교체와-기존-연결)을 읽는다.
+
 ## API
 
 조회(GET)는 토큰 없이, 변경은 `Authorization: Bearer $PGSW_TOKEN`이 필요하다.
@@ -126,8 +128,59 @@ PgBouncer 문서: https://www.pgbouncer.org/config.html#section-databases
 **반영 시점**
 
 - `RELOAD` 직후 새 서버 커넥션부터 새 백엔드로 간다
-- 기존 서버 커넥션은 반납될 때 닫힌다. session 모드에선 클라이언트가 끊을 때까지 이전 백엔드에 남아 있으므로, 전환할 땐 `/pause` → 이전 백엔드 세션 종료 → `PUT /backend` → `/resume` 순서로 한다 (아래 전환 예시)
+- 기존 서버 커넥션은 반납될 때 닫힌다. session 모드에선 클라이언트가 끊을 때까지 이전 백엔드에 남아 있으므로, 전환할 땐 `/pause` → 이전 백엔드 세션 종료 → `PUT /backend` → `/resume` 순서로 한다 ([백엔드 교체와 기존 연결](#백엔드-교체와-기존-연결))
 - 바꾼 값은 컨테이너 안에만 남는다. 재시작하면 `PGSW_BACKEND`로 돌아가므로 유지하려면 그 값도 바꾼다
+
+## 백엔드 교체와 기존 연결
+
+**`PUT /backend`만 하면 한동안 이전 백엔드와 새 백엔드에 연결이 동시에 존재한다.** 전환할 땐 반드시 아래 [전환 예시](#전환-예시) 순서를 따른다.
+
+### 왜 기존 연결은 안 옮겨지나
+
+PgBouncer는 바이트를 흘려보내는 파이프가 아니라, 앱 쪽 연결과 DB 쪽 연결을 따로 들고 짝지어 주는 프록시다.
+
+```
+앱 ──(client 커넥션)──▶ PgBouncer ──(server 커넥션)──▶ PostgreSQL
+```
+
+- client 커넥션과 server 커넥션은 별개의 TCP 연결이다
+- server 커넥션은 맺는 순간의 설정(`host=...`)으로 특정 DB 서버에 붙고, 이후엔 그 서버에 고정된다
+- server 커넥션 하나는 PostgreSQL 백엔드 프로세스 하나와 1:1이고, 그 안에 세션 상태(진행 중 트랜잭션, `SET` 값, prepared statement, advisory lock, 임시 테이블)가 있다. 이 상태는 다른 서버로 옮길 수 없다
+- 그래서 `RELOAD`는 "앞으로 맺을 server 커넥션은 새 host로"만 바꾸고, 기존 server 커넥션은 반납될 때 닫는다
+
+### session 모드에서 생기는 일
+
+session 모드는 client 커넥션 하나에 server 커넥션 하나를 클라이언트가 끊을 때까지 묶어 둔다. `RELOAD` 직후엔 이렇게 섞인다.
+
+```
+client A (RELOAD 전에 맺음) ──▶ PgBouncer ──▶ 이전 백엔드   ← 앱이 끊을 때까지 유지
+client B (RELOAD 후에 맺음) ──▶ PgBouncer ──▶ 새 백엔드
+```
+
+- `[databases]` 설정은 하나지만, 이전 설정으로 맺은 연결이 살아 있는 동안은 두 백엔드에 연결이 공존한다
+- 앱 커넥션 풀은 커넥션을 오래 재사용하므로 이 상태가 오래 갈 수 있다. 그동안 두 DB 모두에 쓰기가 들어갈 수 있다
+- 이전 백엔드를 `NOLOGIN`으로 막아도 새 로그인만 거부할 뿐, 이미 붙은 세션은 계속 쓸 수 있다
+
+| 커넥션 상태 | `RELOAD` 직후 |
+|---|---|
+| 새로 맺는 server 커넥션 | 새 백엔드로 간다 |
+| 놀고 있는(idle) server 커넥션 | 버려지고, 다음 요청부터 새 백엔드로 맺는다 |
+| 클라이언트가 쥐고 있는 server 커넥션 | 반납될 때(session 모드: 앱이 끊을 때)까지 이전 백엔드에 남는다 |
+
+transaction 모드는 트랜잭션마다 server 커넥션을 빌려주고 돌려받으므로 진행 중인 트랜잭션만 끝나면 넘어가지만, 그 사이엔 마찬가지로 두 쪽이 공존한다.
+
+### 전환 순서가 이 문제를 막는 방식
+
+```
+/pause → 이전 백엔드 세션 terminate → PUT /backend → /resume
+```
+
+1. `/pause`: 새 server 커넥션을 더 맺지 않고, 들어오는 요청은 PgBouncer에서 기다리게 한다
+2. terminate: 이전 백엔드 쪽 server 커넥션을 강제로 전부 끊는다. 여기서 남아 있던 연결이 정리되고 `PAUSE`가 완료된다
+3. `PUT /backend`: 이 시점엔 server 커넥션이 하나도 없다
+4. `/resume`: 기다리던 요청과 새 요청이 모두 새 백엔드로 붙는다
+
+`RELOAD`는 "다음 연결부터" 바꾸고, `PAUSE`와 terminate가 "기존 연결"을 비워 줘서 전환 순간에 한쪽 DB만 보이게 된다. terminate된 세션에서 실행 중이던 쿼리는 에러로 끝난다.
 
 ## 전환 예시
 
